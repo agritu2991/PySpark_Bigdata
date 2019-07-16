@@ -1,0 +1,111 @@
+# importing modules
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as sf
+from pyspark.sql.types import *
+from pyspark.sql.functions import udf
+from pyspark.ml.feature import VectorAssembler
+from multiprocessing import Pool
+from math import pi, sqrt, sin, cos, atan2
+from pyspark.ml.clustering import KMeans
+
+# define function to calculate difference between two locations
+def haversine(pos1_lat, pos1_lon, pos2_lat, pos2_lon):
+    lat1 = float(pos1_lat)
+    long1 = float(pos1_lon)
+    lat2 = float(pos2_lat)
+    long2 = float(pos2_lon)
+    degree_to_rad = float(pi / 180.0)
+    d_lat = (lat2 - lat1) * degree_to_rad
+    d_long = (long2 - long1) * degree_to_rad
+    a = pow(sin(d_lat / 2), 2) + cos(lat1 * degree_to_rad) * cos(lat2 * degree_to_rad) * pow(sin(d_long / 2), 2)
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    meters = 6367000 * c
+    return meters
+    
+# read multiple csvfilescsv file and applying some filter and aggregation operations
+
+warehouseLocation = "/Users/rituagrawal/Documents/PyDSSpark/data_processing/spark-warehouse"
+spark = SparkSession.builder.appName("SparkSessionZipsExample").config("spark.sql.warehouse.dir", warehouseLocation).enableHiveSupport().getOrCreate()
+df = spark.read.csv("/Users/rituagrawal/Desktop/PySpark/send/load_data/*", header=True)
+df = df.filter(df.lat.isNotNull())
+df = df.filter(df.lon.isNotNull())
+df = df.filter(df.hh.isin(['10', '11', '15', '16', '17', '18']))
+df_list= df.select("lapuNo").rdd.flatMap(lambda x: x).collect()
+
+number_list= ['1234567890', '0987654321', '9870654321']
+
+def k_mean_for_1(new_df):
+    mean_lat_long = new_df.agg(sf.mean("lat").alias('lat'), sf.mean("lon").alias('lon')).collect()
+    mean_lat_long = [round(mean_lat_long[0].lat, 5), round(mean_lat_long[0].lon, 5)]
+    new_df = new_df.withColumn("centeroid_lat", sf.lit(mean_lat_long[0])).withColumn("centeroid_lon", sf.lit(
+        mean_lat_long[1])).withColumn("prediction", sf.lit(0))
+    return new_df
+ 
+ 
+def k_mean_for_n(new_df, k):
+    kmeans = KMeans().setK(k).setSeed(1)
+    model = kmeans.fit(new_df)
+    cSchema = StructType([StructField("prediction", IntegerType()), StructField("centeroid_lat", DoubleType()),
+                          StructField("centeroid_lon", DoubleType())])
+    test_list = [[index, float(center[0]), float(center[1])] for index, center in enumerate(centers)]
+    center_df = sqlContext.createDataFrame(test_list, schema=cSchema)
+    transformed_df = model.transform(new_df)
+    join_df = transformed_df.join(center_df, ['prediction'], 'left')
+    return join_df
+ 
+def make_data(df1,number, k):
+    try:
+        if not df1.rdd.isEmpty():
+            df1 = df1.withColumn("lat", df1["lat"].cast(DoubleType()))
+            df1 = df1.withColumn("lon", df1["lon"].cast(DoubleType()))
+            ### vector
+            vecAssembler = VectorAssembler(inputCols=["lat", "lon"], outputCol="features")
+            new_df = vecAssembler.transform(df1)
+            # new_df.show()
+            # clusturing
+            if k == 1:
+                join_df = k_mean_for_1(new_df)
+            else:
+                join_df = k_mean_for_n(new_df, k)
+            udf_distance = udf(haversine, DoubleType())
+            join_df = join_df.withColumn('distance', udf_distance(join_df.lat, join_df.lon, join_df.centeroid_lat,
+                                                                  join_df.centeroid_lon))
+            join_df = join_df.withColumn('distance_square', join_df.distance * join_df.distance)
+            join_df = join_df.groupBy("prediction", "lapuNo", "centeroid_lon", "centeroid_lat").agg(
+                sf.count("distance_square").alias("count_of_points"),
+                sf.mean("distance_square").alias("mean_distance_square"),
+                sf.min("distance").alias("min_radius"),
+                sf.max("distance").alias("max_radius")
+            ).withColumn("mse", sf.sqrt("mean_distance_square")).sort(sf.col("lapuNo"), sf.col("prediction"))
+            output_path = "/badw/bharat/mitra/agg_15000_csv/lapuNo={}/k={}".format(number, k)
+            join_df.write.save(output_path)
+    except Exception as e:
+        print('error', e)
+
+from threading import Thread
+import datetime
+k = 4
+threads = []
+for i, number in enumerate(number_list):
+    ## convert into float
+                t = Thread(target=make_data, args=(df.filter(df.lapuNo == number),number, k))
+                threads.append(t)
+                continue
+                if i%100==0:
+                                print(i,datetime.datetime.now())
+                                # Start all threads
+                                for x in threads:
+                                                x.start()
+                                # Wait for all of them to finish
+                                for x in threads:
+                                                x.join()
+                                threads = []
+ 
+print(i,datetime.datetime.now())
+# Start all threads
+for x in threads:
+                x.start()
+# Wait for all of them to finish
+for x in threads:
+                x.join()
+threads = []
